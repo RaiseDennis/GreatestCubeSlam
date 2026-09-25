@@ -3,6 +3,7 @@
 #include "gfx/GL.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <set>
@@ -15,7 +16,7 @@ using namespace cfg;
 namespace {
 
 constexpr std::uint32_t kMagic = 0x43534C4D; // "CSLM"
-constexpr std::uint16_t kProtocol = 1;
+constexpr std::uint16_t kProtocol = 2;
 
 struct MenuEntry {
     const char* label;
@@ -61,6 +62,15 @@ const std::vector<Level>& localVersusLevels() {
 bool addressChar(char32_t c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '.' || c == ':' || c == '-' ||
            c == '[' || c == ']' || c == '_';
+}
+
+/** Typed something code-shaped (8 or 12 code letters, no dots / colons)? Then a failed decode is a typo, not a host name. */
+bool looksLikeCode(const std::string& s) {
+    if (s.find_first_of(".:[]_") != std::string::npos) return false;
+    int n = 0;
+    for (char c : s)
+        if (c != '-' && c != ' ') ++n;
+    return n == 8 || n == 12;
 }
 
 /** Draws the client's own paddle where it predicts it, instead of where the (older) snapshot says. */
@@ -255,7 +265,7 @@ void Game::confirm() {
         break;
     }
     case State::Lobby:
-        if (mode_ == Mode::Client && net_.status() != Net::Status::Connecting && !net_.connected()) connectToHost();
+        if (lobbyEditable()) mode_ == Mode::Host ? knockOnFriend() : connectToHost();
         break;
     case State::Intro:
         if (mode_ != Mode::Client) stateTime_ = 99;
@@ -284,20 +294,25 @@ void Game::handleEvent(const sf::Event& e) {
     }
     using K = sf::Keyboard::Key;
 
-    // Typing the host address: letters are text here, not shortcuts.
-    if (state_ == State::Lobby && mode_ == Mode::Client) {
-        const bool editable = net_.status() != Net::Status::Connecting && !net_.connected();
+    // Typing a code / address in the lobby: letters are text here, not shortcuts.
+    if (state_ == State::Lobby) {
+        const bool editable = lobbyEditable();
+        std::string& text = lobbyInput();
         if (const auto* t = e.getIf<sf::Event::TextEntered>()) {
-            if (editable && addressChar(t->unicode) && joinAddress_.size() < 64) joinAddress_ += char(t->unicode);
+            if (editable && addressChar(t->unicode) && text.size() < 64) text += char(std::toupper(int(t->unicode)));
             return;
         }
         if (const auto* k = e.getIf<sf::Event::KeyPressed>()) {
             if (k->code == K::Escape) quitToTitle();
             else if (k->code == K::Enter) confirm();
-            else if (editable && k->code == K::Backspace && !joinAddress_.empty()) joinAddress_.pop_back();
+            else if (editable && k->code == K::Backspace && !text.empty()) text.pop_back();
             else if (editable && k->code == K::V && k->control) {
                 for (char32_t c : sf::Clipboard::getString())
-                    if (addressChar(c) && joinAddress_.size() < 64) joinAddress_ += char(c);
+                    if (addressChar(c) && text.size() < 64) text += char(std::toupper(int(c)));
+            } else if (k->code == K::C && k->control && !net_.code().empty()) {
+                sf::Clipboard::setString(net_.code());
+                notice_ = "Code copied";
+                noticeTime_ = 2;
             }
             return;
         }
@@ -501,7 +516,7 @@ void Game::fixedStep() {
         sf::Packet p = message(Msg::Snapshot);
         p << worldId_;
         writeSnapshot(p, *world_);
-        net_.send(std::move(p));
+        net_.send(std::move(p), false);
         break;
     }
     case Mode::Client: clientStep(); return;
@@ -576,12 +591,15 @@ void Game::startHosting() {
     setMode(Mode::Host);
     handshaken_ = helloSent_ = false;
     flow_ = {};
+    friendCode_.clear();
+    notice_.clear();
     if (!net_.host(opts_.port)) {
         quitToTitle(net_.error());
         return;
     }
     auto ip = sf::IpAddress::getLocalAddress();
     localAddress_ = ip ? ip->toString() : "unknown";
+    if (net_.localPort() != DefaultPort) localAddress_ += ":" + std::to_string(net_.localPort());
     setState(State::Lobby);
 }
 
@@ -592,29 +610,76 @@ void Game::startJoining() {
     flow_ = {};
     world_.reset();
     notice_.clear();
+    if (!net_.open(DefaultPort)) {
+        quitToTitle(net_.error());
+        return;
+    }
     setState(State::Lobby);
 }
 
+bool Game::lobbyEditable() const {
+    if (mode_ == Mode::Host) return net_.status() == Net::Status::Listening;
+    return net_.status() == Net::Status::Ready;
+}
+
 void Game::connectToHost() {
+    notice_.clear();
+    helloSent_ = false;
+    if (std::optional<Endpoint> code = decodeJoinCode(joinAddress_)) {
+        if (*code == net_.publicEndpoint()) {
+            notice_ = "That's your own code. Type the host's code.";
+            noticeTime_ = 6;
+            return;
+        }
+        net_.connect(*code);
+        return;
+    }
     std::string host;
     unsigned short port = opts_.port;
-    if (!parseAddress(joinAddress_, host, port)) {
-        notice_ = "That doesn't look like an address";
+    if (looksLikeCode(joinAddress_) || !parseAddress(joinAddress_, host, port)) {
+        notice_ = joinAddress_.empty() ? "Type the host's join code first" : "That code has a typo. Check it and try again.";
+        noticeTime_ = 6;
+        return;
+    }
+    net_.connect(host, port);
+}
+
+void Game::knockOnFriend() {
+    if (friendCode_.empty()) return;
+    std::optional<Endpoint> code = decodeJoinCode(friendCode_);
+    if (!code) {
+        notice_ = "That code has a typo. Check it and try again.";
+        noticeTime_ = 6;
+        return;
+    }
+    if (*code == net_.publicEndpoint()) {
+        notice_ = "That's your own code. Type your friend's code.";
         noticeTime_ = 6;
         return;
     }
     notice_.clear();
-    helloSent_ = false;
-    net_.connect(host, port);
+    net_.punch(*code);
+}
+
+std::string Game::routerText() const {
+    if (net_.discovering()) return "Asking your router to open a port...";
+    if (net_.code().empty()) return "Couldn't reach the internet, so there is no code. Players on the same network can still join.";
+    if (net_.portMapped()) return "Your router opened a port for the game automatically, so the code alone should do.";
+    if (net_.strictNat()) return "Your router is strict, so your code may not work. If connecting fails, swap who hosts.";
+    return "No automatic port opening here. If it won't connect, both players type each other's code.";
 }
 
 void Game::netUpdate() {
     net_.poll();
+    if (std::string n = net_.takeNotice(); !n.empty()) {
+        notice_ = n;
+        noticeTime_ = 8;
+    }
     if (net_.status() == Net::Status::Failed) {
         std::string why = net_.error();
-        net_.close();
         if (mode_ == Mode::Client && !handshaken_ && state_ == State::Lobby) {
-            notice_ = why; // stay in the lobby so the address can be fixed
+            startJoining(); // stay in the lobby so the code can be fixed
+            notice_ = why;
             noticeTime_ = 6;
         } else {
             quitToTitle(why);
@@ -773,7 +838,7 @@ void Game::clientStep() {
     predictedX_ = World::movePaddleX(predictedX_, input_, world_->players[Cpu].mirroredTimer > 0, width);
     sf::Packet p = message(Msg::PaddleX);
     p << flow_.worldId << predictedX_;
-    net_.send(std::move(p));
+    net_.send(std::move(p), false);
     placePredictedPaddle(*world_, predictedX_);
 }
 
@@ -847,8 +912,8 @@ void Game::drawTitle(float W, float H, float ui) {
     switch (mode) {
     case Mode::Solo: help = "Mouse or A/D/Arrows: move    Up/Down: mode    Left/Right: level"; break;
     case Mode::Local: help = "P1 (near): mouse or A/D    P2 (far): Left/Right arrows"; break;
-    case Mode::Host: help = "Hosts on TCP port " + std::to_string(opts_.port) + "    Left/Right: arena"; break;
-    case Mode::Client: help = "Connect to a friend who is hosting"; break;
+    case Mode::Host: help = "Get a join code to send a friend    Left/Right: arena"; break;
+    case Mode::Client: help = "Join a friend who is hosting, with their code"; break;
     }
     help += "    Esc/P: pause    M: mute";
     if (audio_.muted()) help += " (muted)";
@@ -857,46 +922,71 @@ void Game::drawTitle(float W, float H, float ui) {
 
 void Game::drawLobby(float W, float H, float ui) {
     auto sz = [&](float s) { return unsigned(std::max(8.f, s * ui)); };
-    const sf::Color white(255, 255, 255), soft(255, 255, 255, 215);
+    const sf::Color white(255, 255, 255), soft(255, 255, 255, 215), warn(255, 90, 70);
     const float pulse = 0.6f + 0.4f * std::sin(stateTime_ * 3);
+    const sf::Color pulsing(255, 255, 255, std::uint8_t(255 * pulse));
+    const bool editable = lobbyEditable();
+    const bool showNotice = noticeTime_ > 0 && !notice_.empty();
+
+    auto inputBox = [&](const std::string& text, float y, float width) {
+        const float boxW = width * ui, boxH = 60 * ui;
+        sf::RectangleShape box({boxW, boxH});
+        box.setOrigin({boxW / 2, boxH / 2});
+        box.setPosition({W / 2, y});
+        box.setFillColor(sf::Color(24, 28, 38, 190));
+        box.setOutlineThickness(3 * ui);
+        box.setOutlineColor(editable ? sf::Color::White : sf::Color(255, 255, 255, 120));
+        window_.draw(box);
+        const bool caret = editable && std::fmod(stateTime_, 1.f) < 0.55f;
+        drawText(text + (caret ? "_" : " "), {W / 2, y}, sz(30), white, 0.5f);
+    };
+    auto ownCode = [&](float y, float size) {
+        if (net_.discovering()) drawText("finding your code...", {W / 2, y}, sz(size * 0.6f), pulsing, 0.5f, 3 * ui, kInk);
+        else if (net_.code().empty()) drawText("no code (offline?)", {W / 2, y}, sz(size * 0.6f), soft, 0.5f, 3 * ui, kInk);
+        else drawText(net_.code(), {W / 2, y}, sz(size), white, 0.5f, 5 * ui, kInk);
+    };
 
     if (mode_ == Mode::Host) {
-        drawText("HOSTING", {W / 2, H * 0.22f}, sz(72), white, 0.5f, 5 * ui, kInk);
-        drawText(net_.connected() ? "Player connected..." : "Waiting for a player to join...", {W / 2, H * 0.36f}, sz(30),
-                 sf::Color(255, 255, 255, std::uint8_t(255 * pulse)), 0.5f, 3 * ui, kInk);
-        drawText("Your address:  " + localAddress_ + "   (port " + std::to_string(net_.port()) + ")", {W / 2, H * 0.47f}, sz(28), white,
-                 0.5f, 3 * ui, kInk);
-        drawText("Same network: share the address above.  Over the internet: forward TCP port " + std::to_string(net_.port()) +
-                     " to this computer and share your public IP.",
-                 {W / 2, H * 0.54f}, sz(17), soft, 0.5f, 2 * ui, kInk);
-        drawText("ARENA " + std::to_string(titleLevel_ + 1) + "  -  " + themes()[titleLevel_ % themes().size()].name, {W / 2, H * 0.65f},
-                 sz(24), white, 0.5f, 3 * ui, kInk);
-        drawText("Esc: cancel", {W / 2, H * 0.9f}, sz(20), white, 0.5f, 2 * ui, kInk);
+        drawText("HOSTING", {W / 2, H * 0.15f}, sz(64), white, 0.5f, 5 * ui, kInk);
+        drawText(net_.connected() ? "Player connected..." : "Waiting for a player to join...", {W / 2, H * 0.25f}, sz(26), pulsing, 0.5f,
+                 3 * ui, kInk);
+        drawText("YOUR JOIN CODE  -  send it to your friend", {W / 2, H * 0.33f}, sz(20), soft, 0.5f, 2 * ui, kInk);
+        ownCode(H * 0.40f, 60);
+        drawText(routerText(), {W / 2, H * 0.47f}, sz(17), soft, 0.5f, 2 * ui, kInk);
+        drawText("Same network? They can also type:  " + localAddress_, {W / 2, H * 0.515f}, sz(17), soft, 0.5f, 2 * ui, kInk);
+
+        drawText("Friend can't get in? Type THEIR code here and press Enter:", {W / 2, H * 0.6f}, sz(20), soft, 0.5f, 2 * ui, kInk);
+        inputBox(friendCode_, H * 0.665f, 420);
+        if (showNotice) drawText(notice_, {W / 2, H * 0.735f}, sz(22), warn, 0.5f, 3 * ui, kInk);
+        else if (net_.punching() && !net_.connected())
+            drawText("Knocking on your friend's router... (keep their Join screen open)", {W / 2, H * 0.735f}, sz(20), pulsing, 0.5f, 3 * ui,
+                     kInk);
+
+        drawText("ARENA " + std::to_string(titleLevel_ + 1) + "  -  " + themes()[titleLevel_ % themes().size()].name, {W / 2, H * 0.81f},
+                 sz(22), white, 0.5f, 3 * ui, kInk);
+        drawText("Ctrl+C: copy your code    Ctrl+V: paste    Esc: cancel", {W / 2, H * 0.92f}, sz(19), white, 0.5f, 2 * ui, kInk);
         return;
     }
 
     const bool connecting = net_.status() == Net::Status::Connecting;
-    drawText("JOIN GAME", {W / 2, H * 0.22f}, sz(72), white, 0.5f, 5 * ui, kInk);
-    drawText("Host address (IP or name, optionally :port)", {W / 2, H * 0.36f}, sz(22), soft, 0.5f, 2 * ui, kInk);
-
-    const float boxW = 560 * ui, boxH = 64 * ui;
-    sf::RectangleShape box({boxW, boxH});
-    box.setOrigin({boxW / 2, boxH / 2});
-    box.setPosition({W / 2, H * 0.45f});
-    box.setFillColor(sf::Color(24, 28, 38, 190));
-    box.setOutlineThickness(3 * ui);
-    box.setOutlineColor(connecting ? sf::Color(255, 255, 255, 120) : sf::Color::White);
-    window_.draw(box);
-    const bool caret = !connecting && !net_.connected() && std::fmod(stateTime_, 1.f) < 0.55f;
-    drawText(joinAddress_ + (caret ? "_" : " "), {W / 2, H * 0.45f}, sz(32), white, 0.5f);
+    drawText("JOIN GAME", {W / 2, H * 0.15f}, sz(64), white, 0.5f, 5 * ui, kInk);
+    drawText("Type the host's join code (or their IP address on the same network)", {W / 2, H * 0.26f}, sz(20), soft, 0.5f, 2 * ui, kInk);
+    inputBox(joinAddress_, H * 0.335f, 520);
 
     if (net_.connected())
-        drawText("Connected! Waiting for the host...", {W / 2, H * 0.56f}, sz(26), white, 0.5f, 3 * ui, kInk);
+        drawText("Connected! Waiting for the host...", {W / 2, H * 0.42f}, sz(26), white, 0.5f, 3 * ui, kInk);
     else if (connecting)
-        drawText("Connecting...", {W / 2, H * 0.56f}, sz(26), sf::Color(255, 255, 255, std::uint8_t(255 * pulse)), 0.5f, 3 * ui, kInk);
-    else if (noticeTime_ > 0 && !notice_.empty())
-        drawText(notice_, {W / 2, H * 0.56f}, sz(24), sf::Color(255, 90, 70), 0.5f, 3 * ui, kInk);
-    drawText("Enter: connect    Ctrl+V: paste    Esc: back", {W / 2, H * 0.9f}, sz(20), white, 0.5f, 2 * ui, kInk);
+        drawText("Connecting...", {W / 2, H * 0.42f}, sz(26), pulsing, 0.5f, 3 * ui, kInk);
+    else if (showNotice)
+        drawText(notice_, {W / 2, H * 0.42f}, sz(22), warn, 0.5f, 3 * ui, kInk);
+
+    drawText("YOUR CODE", {W / 2, H * 0.53f}, sz(20), soft, 0.5f, 2 * ui, kInk);
+    ownCode(H * 0.595f, 44);
+    drawText("Won't connect? Send this code to the host. They type it in while you stay on this screen.", {W / 2, H * 0.66f}, sz(17), soft,
+             0.5f, 2 * ui, kInk);
+    if (!net_.discovering() && !net_.code().empty())
+        drawText(routerText(), {W / 2, H * 0.7f}, sz(17), soft, 0.5f, 2 * ui, kInk);
+    drawText("Enter: connect    Ctrl+V: paste    Ctrl+C: copy your code    Esc: back", {W / 2, H * 0.92f}, sz(19), white, 0.5f, 2 * ui, kInk);
 }
 
 void Game::drawHud() {

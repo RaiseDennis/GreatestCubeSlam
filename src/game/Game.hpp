@@ -27,7 +27,7 @@ public:
         float screenshotAt = 5;       // ...after this many seconds
         bool local = false;           // start a local two-player match
         bool host = false;            // start hosting an online match
-        std::string join;             // join an online match at this address
+        std::string join;             // join an online match by join code or address
         unsigned short port = DefaultPort;
     };
 
@@ -58,6 +58,10 @@ private:
     void startHosting();
     void startJoining();
     void connectToHost();
+    void knockOnFriend();
+    std::string& lobbyInput() { return mode_ == Mode::Host ? friendCode_ : joinAddress_; }
+    bool lobbyEditable() const;
+    std::string routerText() const;
     void netUpdate();
     void handleHostMessage(sf::Packet& p);
     void handleClientMessage(sf::Packet& p);
@@ -124,7 +128,8 @@ private:
     // online
     Net net_;
     bool handshaken_ = false, helloSent_ = false;
-    std::string joinAddress_ = "127.0.0.1";
+    std::string joinAddress_;                     // client: host code or address being typed
+    std::string friendCode_;                      // host: joiner code being typed (for strict routers)
     std::string localAddress_;
     std::uint32_t levelSerial_ = 0, worldId_ = 0; // host counters
     Flow flow_;                                   // host: last sent, client: last received

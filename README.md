@@ -36,11 +36,21 @@ The 12 levels double as versus arenas. First to 3 points wins the match, then En
 
 **2 players, same computer.** Player 1 defends the near end with the mouse or A/D. Player 2 defends the far end with the Left/Right arrow keys. The camera switches to a shared overhead view. Fog is left out in this mode because it would blind both players.
 
-**Online.** One player picks *Host online game*. The lobby shows their LAN address and the port (TCP 27015). The other player picks *Join online game* and types that address, optionally as `address:port`. Each player sees the arena from their own end. For play over the internet, the host forwards TCP port 27015 on their router and shares their public IP. Both players must run the same version of the game.
+**Online, peer to peer, no port forwarding.** One player picks *Host online game* and gets a join code such as `TYYQ-GRWV`. They send it to their friend however they like. The friend picks *Join online game*, types or pastes the code, and presses Enter. Each player sees the arena from their own end. Both players must run the same version of the game.
 
-How it works: the host runs the authoritative simulation and sends a snapshot of the world (plus its sound/particle events) after every 60 Hz step. The client sends only its paddle position, which it also predicts locally so its own paddle responds without lag. Pausing pauses the game for both players. If either player quits, the other goes back to the title screen.
+If the friend can't get in (both routers are strict), the Join screen also shows the friend's own code. The host types it into the box on the Host screen while the friend stays on the Join screen. Now both sides knock at the same time, which gets through most routers. On the same network, the joiner can also type the host's LAN IP address instead of a code.
 
-Command line shortcuts: `--local`, `--host`, `--join ADDRESS[:PORT]`, and `--port N` (for hosting, or the default port when joining). They combine with `--level N` and `--demo`.
+How the connection works, with no server of our own, the same way many peer-to-peer games and WebRTC connect:
+
+1. **Finding your address.** Each game asks a public STUN server (Google's or Cloudflare's) what its address looks like from the internet. It also asks the router to forward its UDP port automatically (UPnP), if the router allows that. The join code is that public address and port, written with an unambiguous alphabet and a checksum that catches typos. It is 8 characters when the router keeps the game's port (UDP 27015) and 12 otherwise.
+2. **Hole punching.** The joiner keeps sending packets to the host's code. A router lets packets in from an address it has just sent to, so when both sides send to each other, both routers open. That is why typing each other's codes helps. On a LAN the joiner also broadcasts, because many routers can't loop traffic for their own public address back inside.
+3. **When it can't work.** If both players are behind "symmetric" NATs (some mobile hotspots, company or university networks, carrier-grade NAT), there is no way through without a relay server, and the lobby warns about a strict router. Swapping who hosts sometimes helps. The first time you host, Windows may ask whether to allow Cube Slam on the network. Allow it.
+
+Note: a join code contains your public IP address, just like a URL to your own server would. Only share it with people you want to play with.
+
+How the game runs over the connection: the host runs the authoritative simulation and sends a snapshot of the world (plus its sound/particle events) after every 60 Hz step. The client sends only its paddle position, which it also predicts locally so its own paddle responds without lag. Snapshots and paddle positions travel unreliably, and only the newest one counts. The handshake, the game flow and pause requests go over a small reliable, ordered channel with acknowledgements and resends. Pausing pauses the game for both players. If either player quits, the other goes back to the title screen.
+
+Command line shortcuts: `--local`, `--host`, `--join CODE` (or `--join ADDRESS[:PORT]` on a LAN), and `--port N` (the UDP port to host on, or the default port for joining by address). They combine with `--level N` and `--demo`.
 
 ## Power-ups
 
@@ -68,10 +78,11 @@ src/gfx/     tiny 3D library: math (Vec/Mat4), GL function loader (via sf::Conte
 src/game/    World (fixed 60 Hz simulation: SAT collisions, puck/paddle/shield rules),
              Levels (the 12 levels + obstacle/force layouts), AI, Scene (3D visuals,
              particles, camera, CUBOT), Audio (all sound effects synthesized at runtime),
-             Net (online play: TCP transport + snapshot protocol), Game (state machine, modes + HUD)
+             Net (online play: UDP peer to peer, join codes, STUN/UPnP, reliable channel,
+             snapshot protocol), Game (state machine, modes + HUD)
 ```
 
-For testing, `CubeSlam.exe --selftest` runs a headless simulation of all 12 levels, with both paddles automated, and checks for physics problems. It then plays two-player matches and pushes every step through the network snapshot format. `--level N --demo --shot out.png --shot-at 8` starts at level N with the autopilot playing, saves a screenshot after 8 seconds, and quits.
+For testing, `CubeSlam.exe --selftest` runs a headless simulation of all 12 levels, with both paddles automated, and checks for physics problems. It then plays two-player matches and pushes every step through the network snapshot format, checks join codes, and runs two connections over loopback (one with 30% simulated packet loss). `--level N --demo --shot out.png --shot-at 8` starts at level N with the autopilot playing, saves a screenshot after 8 seconds, and quits.
 
 ## Credits
 

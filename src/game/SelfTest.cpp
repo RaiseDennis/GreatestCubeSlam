@@ -4,6 +4,8 @@
 #include "game/Net.hpp"
 #include "game/World.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -36,6 +38,7 @@ int versusSelfTest(std::mt19937& rng) {
         const Level& level = levels[li];
         LevelSet set = makeLevelSet(level.set, rng);
         int scores[2] = {0, 0}, round = 1, serve = Human, frames = 0, events = 0, mismatches = 0, stalls = 0;
+        std::size_t biggest = 0;
         while (scores[0] < WinningScore && scores[1] < WinningScore && round < 12) {
             World host(level, set, round, serve, rng());
             World client(level, set, round, serve, 0);
@@ -52,6 +55,7 @@ int versusSelfTest(std::mt19937& rng) {
 
                 sf::Packet sent, echoed;
                 writeSnapshot(sent, host);
+                biggest = std::max(biggest, sent.getDataSize());
                 if (!readSnapshot(sent, client)) {
                     ++mismatches;
                     continue;
@@ -68,8 +72,8 @@ int versusSelfTest(std::mt19937& rng) {
             serve = loser;
             ++round;
         }
-        std::printf("versus %2zu %-16s  p1 %d - %d p2 | %4.1fs/round | %5d events | snapshot mismatches %d%s\n", li + 1,
-                    set.name.c_str(), scores[0], scores[1], frames / 60.f / std::max(1, round - 1), events, mismatches,
+        std::printf("versus %2zu %-16s  p1 %d - %d p2 | %4.1fs/round | %5d events | snapshot mismatches %d, max %zu B%s\n", li + 1,
+                    set.name.c_str(), scores[0], scores[1], frames / 60.f / std::max(1, round - 1), events, mismatches, biggest,
                     stalls ? "  (endless rally)" : "");
         problems += mismatches;
     }
@@ -90,6 +94,98 @@ int versusSelfTest(std::mt19937& rng) {
     if (!ok) std::printf("  !! address parsing failed\n"), ++problems;
     return problems;
 }
+
+/** Join codes round-trip and catch typos; two Nets on loopback connect and deliver over a lossy link. */
+int netSelfTest(std::mt19937& rng) {
+    int problems = 0;
+
+    // --- join codes ---
+    int bad = 0, typos = 0, caught = 0;
+    for (int i = 0; i < 2000; ++i) {
+        Endpoint e{std::uint32_t(rng()) | 1, i % 2 ? DefaultPort : static_cast<unsigned short>(1 + rng() % 65535)};
+        std::string code = encodeJoinCode(e);
+        std::optional<Endpoint> back = decodeJoinCode(code);
+        std::string sloppy = code;
+        for (char& c : sloppy) c = char(std::tolower(static_cast<unsigned char>(c)));
+        sloppy.erase(std::remove(sloppy.begin(), sloppy.end(), '-'), sloppy.end());
+        if (!back || *back != e || decodeJoinCode(sloppy) != back || code.size() != (e.port == DefaultPort ? 9u : 14u)) ++bad;
+        // one wrong character
+        std::size_t at = rng() % code.size();
+        if (code[at] == '-') continue;
+        std::string typo = code;
+        typo[at] = typo[at] == 'X' ? 'Y' : 'X';
+        ++typos;
+        if (!decodeJoinCode(typo)) ++caught;
+    }
+    std::printf("join codes: e.g. %s / %s | %d bad round trips | %d/%d single typos caught\n",
+                encodeJoinCode({0xC0A80114, DefaultPort}).c_str(), encodeJoinCode({0x5DB8D822, 40123}).c_str(), bad, caught, typos);
+    if (bad || caught < typos * 9 / 10) std::printf("  !! join codes\n"), ++problems;
+
+    // --- loopback session with 30% packet loss both ways ---
+    Net host, joiner;
+    if (!host.host(0, false) || !joiner.open(0, false)) {
+        std::printf("  !! could not open UDP sockets\n");
+        return problems + 1;
+    }
+    host.setTestLoss(0.3f);
+    joiner.setTestLoss(0.3f);
+    joiner.connect(Endpoint{0x7F000001, host.localPort()}); // by code...
+    const int kCount = 300;
+    int got[2] = {0, 0}, disorder = 0, unreliable = 0;
+    sf::Clock clock;
+    bool sent = false;
+    while (clock.getElapsedTime() < sf::seconds(20)) {
+        host.poll();
+        joiner.poll();
+        if (host.connected() && joiner.connected() && !sent) {
+            for (int i = 0; i < kCount; ++i) {
+                sf::Packet a, b, u;
+                a << std::int32_t(i);
+                b << std::int32_t(i);
+                u << std::int32_t(-1);
+                host.send(a);
+                joiner.send(b);
+                host.send(u, false);
+            }
+            sent = true;
+        }
+        Net* nets[2] = {&host, &joiner};
+        for (int side = 0; side < 2; ++side)
+            while (std::optional<sf::Packet> p = nets[side]->receive()) {
+                std::int32_t v = 0;
+                *p >> v;
+                if (v < 0) ++unreliable;
+                else if (v != got[side]++) ++disorder;
+            }
+        if (got[0] == kCount && got[1] == kCount) break;
+        sf::sleep(sf::milliseconds(2));
+    }
+    std::printf("loopback: connected %s | reliable %d+%d/%d in order (%d out of order) | unreliable %d/%d | %.1fs at 30%% loss\n",
+                host.connected() && joiner.connected() ? "yes" : "NO", got[0], got[1], kCount, disorder, unreliable, kCount,
+                clock.getElapsedTime().asSeconds());
+    if (got[0] != kCount || got[1] != kCount || disorder) std::printf("  !! loopback session\n"), ++problems;
+
+    joiner.close(); // says Bye
+    for (int i = 0; i < 50 && host.status() != Net::Status::Failed; ++i) {
+        host.poll();
+        sf::sleep(sf::milliseconds(5));
+    }
+    if (host.status() != Net::Status::Failed) std::printf("  !! host did not notice the joiner leaving\n"), ++problems;
+
+    // --- the other way round: the host types the joiner's code, the joiner never typed anything ---
+    Net host2, joiner2;
+    if (!host2.host(0, false) || !joiner2.open(0, false)) return problems + 1;
+    host2.punch(Endpoint{0x7F000001, joiner2.localPort()});
+    for (int i = 0; i < 500 && !(host2.connected() && joiner2.connected()); ++i) {
+        host2.poll();
+        joiner2.poll();
+        sf::sleep(sf::milliseconds(2));
+    }
+    std::printf("reverse knock: %s\n", host2.connected() && joiner2.connected() ? "connected" : "FAILED");
+    if (!host2.connected() || !joiner2.connected()) ++problems;
+    return problems;
+}
+
 
 int runSelfTest() {
     std::mt19937 rng(1234);
@@ -149,6 +245,7 @@ int runSelfTest() {
         if (timeouts) ++problems;
     }
     problems += versusSelfTest(rng);
+    problems += netSelfTest(rng);
     std::printf(problems ? "SELFTEST: %d problem(s)\n" : "SELFTEST: OK\n", problems);
     return problems ? 1 : 0;
 }
