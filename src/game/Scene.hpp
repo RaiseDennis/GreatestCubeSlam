@@ -20,7 +20,15 @@ struct Label {
 /** Visual representation of a World: meshes, camera, particles, and CUBOT the robot. */
 class Scene {
 public:
+    /** Solo: behind the bottom paddle. Overhead: shared view for two local players. Top: behind the top paddle. */
+    enum class View { Solo, Overhead, Top };
+
     bool init();
+    /** Camera and presentation for the game mode. CUBOT only shows up when it is playing. */
+    void setView(View view, bool cubotPlays) { view_ = view; cubotPlays_ = cubotPlays; }
+    View view() const { return view_; }
+    /** Suffixes for power-up pick-up texts, per side (e.g. "!" and " (CUBOT)"). */
+    void setSideTags(std::string bottom, std::string top) { sideTags_[0] = std::move(bottom); sideTags_[1] = std::move(top); }
     void setupLevel(const World& world, const Theme& theme);
     void rebuildObstacles(const World& world);
 
@@ -80,9 +88,12 @@ private:
     float time_ = 0;
     float introTime_ = 99;
     float shake_ = 0;
-    float fog_ = 0; // 0..1 fog amount for the human view
-    float humanX_ = 0;
+    float fog_ = 0; // 0..1 fog amount for the viewing player
+    float humanX_ = 0; // paddle the camera follows
     bool titleMode_ = true;
+    View view_ = View::Solo;
+    bool cubotPlays_ = true;
+    std::string sideTags_[2] = {"!", " (CUBOT)"};
 
     float robotHappy_ = 0, robotHurt_ = 0;
     bool robotAlive_ = true;

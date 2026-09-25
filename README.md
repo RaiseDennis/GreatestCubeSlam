@@ -4,6 +4,8 @@ A 3D remake of [Cube Slam](https://github.com/schnabear/cubeslam) (the WebGL/Web
 
 Deflect the puck past CUBOT the robot's shields. First to 3 points wins the level, and there are 12 levels with obstacles, force fields, and power-ups.
 
+You can also play another person, either on the same computer or online (see [Multiplayer](#multiplayer)).
+
 ## Build (Windows)
 
 No preinstalled tools needed. The scripts download a portable toolchain into `.tools/` (no admin rights, no system changes):
@@ -23,9 +25,22 @@ Other platforms: any C++17 compiler plus CMake 3.24+ works with `cmake -S . -B b
 | --- | --- |
 | Mouse, or A/D / arrow keys | move paddle |
 | Click / Enter | start / continue |
-| Left/Right on the title screen | choose starting level |
+| Up/Down on the title screen | choose the mode (1 player, 2 players, host, join) |
+| Left/Right on the title screen | choose the starting level / arena |
 | Esc or P | pause (Q in the pause menu quits to the title screen) |
 | M | mute |
+
+## Multiplayer
+
+The 12 levels double as versus arenas. First to 3 points wins the match, then Enter moves to the next arena. Power-ups work the same as in single player.
+
+**2 players, same computer.** Player 1 defends the near end with the mouse or A/D. Player 2 defends the far end with the Left/Right arrow keys. The camera switches to a shared overhead view. Fog is left out in this mode because it would blind both players.
+
+**Online.** One player picks *Host online game*. The lobby shows their LAN address and the port (TCP 27015). The other player picks *Join online game* and types that address, optionally as `address:port`. Each player sees the arena from their own end. For play over the internet, the host forwards TCP port 27015 on their router and shares their public IP. Both players must run the same version of the game.
+
+How it works: the host runs the authoritative simulation and sends a snapshot of the world (plus its sound/particle events) after every 60 Hz step. The client sends only its paddle position, which it also predicts locally so its own paddle responds without lag. Pausing pauses the game for both players. If either player quits, the other goes back to the title screen.
+
+Command line shortcuts: `--local`, `--host`, `--join ADDRESS[:PORT]`, and `--port N` (for hosting, or the default port when joining). They combine with `--level N` and `--demo`.
 
 ## Power-ups
 
@@ -53,10 +68,10 @@ src/gfx/     tiny 3D library: math (Vec/Mat4), GL function loader (via sf::Conte
 src/game/    World (fixed 60 Hz simulation: SAT collisions, puck/paddle/shield rules),
              Levels (the 12 levels + obstacle/force layouts), AI, Scene (3D visuals,
              particles, camera, CUBOT), Audio (all sound effects synthesized at runtime),
-             Game (state machine + HUD)
+             Net (online play: TCP transport + snapshot protocol), Game (state machine, modes + HUD)
 ```
 
-For testing, `CubeSlam.exe --selftest` runs a headless simulation of all 12 levels, with both paddles automated, and checks for physics problems. `--level N --demo --shot out.png --shot-at 8` starts at level N with the autopilot playing, saves a screenshot after 8 seconds, and quits.
+For testing, `CubeSlam.exe --selftest` runs a headless simulation of all 12 levels, with both paddles automated, and checks for physics problems. It then plays two-player matches and pushes every step through the network snapshot format. `--level N --demo --shot out.png --shot-at 8` starts at level N with the autopilot playing, saves a screenshot after 8 seconds, and quits.
 
 ## Credits
 

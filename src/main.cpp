@@ -16,6 +16,10 @@ int main(int argc, char** argv) {
         auto arg = [&](const char* name) { return std::strcmp(argv[i], name) == 0 && i + 1 < argc; };
         if (std::strcmp(argv[i], "--selftest") == 0) return game::runSelfTest();
         if (std::strcmp(argv[i], "--demo") == 0) opts.demo = true;
+        else if (std::strcmp(argv[i], "--local") == 0) opts.local = true;
+        else if (std::strcmp(argv[i], "--host") == 0) opts.host = true;
+        else if (arg("--join")) opts.join = argv[++i];
+        else if (arg("--port")) opts.port = static_cast<unsigned short>(std::atoi(argv[++i]));
         else if (arg("--level")) opts.startLevel = std::atoi(argv[++i]) - 1;
         else if (arg("--shot")) opts.screenshotPath = argv[++i];
         else if (arg("--shot-at")) opts.screenshotAt = float(std::atof(argv[++i]));

@@ -9,7 +9,8 @@ namespace game {
 
 using gfx::Vec2;
 
-enum Side { Human = 0, Cpu = 1 }; // Human defends the bottom (large y), CPU the top.
+// Human defends the bottom (large y), CPU the top. In versus modes "Cpu" is simply the top player.
+enum Side { Human = 0, Cpu = 1 };
 inline int other(int side) { return 1 - side; }
 
 struct Puck {
@@ -109,7 +110,15 @@ class World {
 public:
     World(const Level& level, const LevelSet& set, int round, int serveTowards, std::uint32_t seed);
 
+    /** Human (bottom) vs a directly positioned top paddle (AI or network player, see setCpuPaddleX). */
     void step(const HumanInput& input);
+    /** Two local players, both steering with HumanInput. */
+    void step(const HumanInput& bottom, const HumanInput& top);
+
+    /** One frame of player-steered paddle motion. Also used by the network client to predict its own paddle. */
+    static float movePaddleX(float x, const HumanInput& input, bool mirrored, float width, float wobble = 0);
+    /** Sideways wobble of a dizzy paddle. */
+    float dizzyOffset(int side) const;
 
     // --- state (read by renderer/AI) ---
     const Level& level;
@@ -132,10 +141,11 @@ public:
 
     float deathballTimer = 0;
 
-    /** Direct paddle control for the AI (absolute x, clamped). */
+    /** Direct top paddle control for the AI or a network player (absolute x, clamped). */
     void setCpuPaddleX(float x);
 
 private:
+    void stepImpl(const HumanInput& bottom, const HumanInput* top);
     void createShields(int side);
     void stepPuck(Puck& p);
     void collidePuck(Puck& p);

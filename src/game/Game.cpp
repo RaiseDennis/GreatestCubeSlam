@@ -14,6 +14,21 @@ using namespace cfg;
 
 namespace {
 
+constexpr std::uint32_t kMagic = 0x43534C4D; // "CSLM"
+constexpr std::uint16_t kProtocol = 1;
+
+struct MenuEntry {
+    const char* label;
+    Game::Mode mode;
+};
+const MenuEntry kMenu[] = {
+    {"1 PLAYER  vs CUBOT", Game::Mode::Solo},
+    {"2 PLAYERS  same computer", Game::Mode::Local},
+    {"HOST ONLINE GAME", Game::Mode::Host},
+    {"JOIN ONLINE GAME", Game::Mode::Client},
+};
+constexpr int kMenuCount = int(std::size(kMenu));
+
 sf::Color toSf(gfx::Color c) {
     auto b = [](float v) { return std::uint8_t(std::clamp(v, 0.f, 1.f) * 255); };
     return {b(c.r), b(c.g), b(c.b), b(c.a)};
@@ -25,9 +40,41 @@ std::string fmt(const char* f, float v) {
     return buf;
 }
 
+sf::Packet message(Msg m) {
+    sf::Packet p;
+    p << std::uint8_t(m);
+    return p;
+}
+
+/** Local versus uses the same arenas, minus fog: on a shared screen it would blind both players. */
+const std::vector<Level>& localVersusLevels() {
+    static const std::vector<Level> list = [] {
+        std::vector<Level> l = singlePlayerLevels();
+        for (auto& lv : l)
+            lv.extras.erase(std::remove_if(lv.extras.begin(), lv.extras.end(), [](const ExtraDef& d) { return d.type == ExtraType::Fog; }),
+                            lv.extras.end());
+        return l;
+    }();
+    return list;
+}
+
+bool addressChar(char32_t c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '.' || c == ':' || c == '-' ||
+           c == '[' || c == ']' || c == '_';
+}
+
+/** Draws the client's own paddle where it predicts it, instead of where the (older) snapshot says. */
+void placePredictedPaddle(World& w, float x) {
+    Paddle& pd = w.paddles[Cpu];
+    float hw = pd.width() / 2;
+    pd.x = std::clamp(x + w.dizzyOffset(Cpu), hw, ArenaW - hw);
+}
+
 const sf::Color kInk{24, 28, 38};
 
 } // namespace
+
+HumanInput autoPilot(const World& w, float wobble, int side); // SelfTest.cpp
 
 bool Game::init() {
     if (!gl::load()) {
@@ -51,7 +98,19 @@ bool Game::init() {
 
     window_.setKeyRepeatEnabled(false);
     setState(State::Title);
-    if (opts_.startLevel >= 0) startLevel(opts_.startLevel);
+    if (opts_.startLevel >= 0) titleLevel_ = std::clamp(opts_.startLevel, 0, int(singlePlayerLevels().size()) - 1);
+    if (opts_.host) {
+        startHosting();
+    } else if (!opts_.join.empty()) {
+        joinAddress_ = opts_.join;
+        startJoining();
+        connectToHost();
+    } else if (opts_.local) {
+        setMode(Mode::Local);
+        startLevel(titleLevel_);
+    } else if (opts_.startLevel >= 0) {
+        startLevel(titleLevel_);
+    }
     return true;
 }
 
@@ -73,54 +132,143 @@ void Game::run() {
             window_.close();
         }
     }
+    net_.close();
+}
+
+// ---------------------------------------------------------------- helpers
+
+bool Game::inPlay() const {
+    return state_ == State::Intro || state_ == State::Countdown || state_ == State::Playing || state_ == State::RoundEnd;
+}
+
+void Game::updateCursor() { window_.setMouseCursorVisible(paused_ || !inPlay()); }
+
+const std::vector<Level>& Game::levels() const { return mode_ == Mode::Local ? localVersusLevels() : singlePlayerLevels(); }
+
+std::string Game::sideName(int side) const {
+    switch (mode_) {
+    case Mode::Solo: return side == Human ? "YOU" : "CUBOT";
+    case Mode::Local: return side == Human ? "P1" : "P2";
+    default: return side == localSide() ? "YOU" : "RIVAL";
+    }
+}
+
+sf::Color Game::sideColor(int side) const {
+    const Theme& th = scene_.theme();
+    return toSf(side == Human ? th.shieldHuman : th.shieldCpu);
 }
 
 // ---------------------------------------------------------------- flow
+
+void Game::setMode(Mode m) {
+    mode_ = m;
+    switch (m) {
+    case Mode::Solo:
+        scene_.setView(Scene::View::Solo, true);
+        scene_.setSideTags("!", " (CUBOT)");
+        break;
+    case Mode::Local:
+        scene_.setView(Scene::View::Overhead, false);
+        scene_.setSideTags(" (P1)", " (P2)");
+        break;
+    case Mode::Host:
+        scene_.setView(Scene::View::Solo, false);
+        scene_.setSideTags("!", " (RIVAL)");
+        break;
+    case Mode::Client:
+        scene_.setView(Scene::View::Top, false);
+        scene_.setSideTags(" (RIVAL)", "!");
+        break;
+    }
+}
 
 void Game::setState(State s) {
     state_ = s;
     stateTime_ = 0;
     lastCountdown_ = -1;
-    bool playing = s == State::Intro || s == State::Countdown || s == State::Playing || s == State::RoundEnd;
-    window_.setMouseCursorVisible(!playing);
-    scene_.setTitleMode(s == State::Title);
+    updateCursor();
+    scene_.setTitleMode(s == State::Title || s == State::Lobby);
 }
 
 void Game::startLevel(int index) {
-    const auto& levels = singlePlayerLevels();
-    levelIndex_ = std::clamp(index, 0, int(levels.size()) - 1);
+    levelIndex_ = std::clamp(index, 0, int(levels().size()) - 1);
     scores_[0] = scores_[1] = 0;
     round_ = 1;
     serve_ = Human;
     paused_ = false;
-    set_ = makeLevelSet(levels[levelIndex_].set, rng_);
+    ++levelSerial_;
+    set_ = makeLevelSet(levels()[levelIndex_].set, rng_);
     newRound();
     scene_.setupLevel(*world_, themes()[levelIndex_ % themes().size()]);
     scene_.robotReset();
     scene_.startIntro();
-    input_ = {};
+    input_ = input2_ = {};
     setState(State::Intro);
 }
 
 void Game::newRound() {
-    const Level& level = singlePlayerLevels()[levelIndex_];
+    const Level& level = levels()[levelIndex_];
     world_ = std::make_unique<World>(level, set_, round_, serve_, rng_());
-    ai_ = std::make_unique<AI>(level.ai, rng_());
+    if (mode_ == Mode::Solo) ai_ = std::make_unique<AI>(level.ai, rng_());
+    else ai_.reset();
+    ++worldId_;
+    remoteTarget_ = remoteX_ = predictedX_ = ArenaW / 2;
     scene_.rebuildObstacles(*world_);
     accumulator_ = 0;
 }
 
+void Game::quitToTitle(const std::string& notice) {
+    net_.close();
+    handshaken_ = helloSent_ = false;
+    paused_ = false;
+    setMode(Mode::Solo);
+    setState(State::Title);
+    if (!notice.empty()) {
+        notice_ = notice;
+        noticeTime_ = 6;
+    }
+}
+
+void Game::togglePause() {
+    if (mode_ == Mode::Client) {
+        net_.send(message(Msg::PauseToggle)); // the host decides; the flow message brings the result back
+        return;
+    }
+    paused_ = !paused_;
+    updateCursor();
+}
+
 void Game::confirm() {
-    if (paused_) { paused_ = false; window_.setMouseCursorVisible(false); return; }
+    if (paused_) {
+        togglePause();
+        return;
+    }
     switch (state_) {
-    case State::Title: startLevel(titleLevel_); break;
-    case State::Intro: stateTime_ = 99; break;
+    case State::Title: {
+        Mode m = kMenu[menuItem_].mode;
+        if (m == Mode::Host) startHosting();
+        else if (m == Mode::Client) startJoining();
+        else {
+            setMode(m);
+            startLevel(titleLevel_);
+        }
+        break;
+    }
+    case State::Lobby:
+        if (mode_ == Mode::Client && net_.status() != Net::Status::Connecting && !net_.connected()) connectToHost();
+        break;
+    case State::Intro:
+        if (mode_ != Mode::Client) stateTime_ = 99;
+        break;
     case State::LevelWon:
-        if (levelIndex_ + 1 < int(singlePlayerLevels().size())) startLevel(levelIndex_ + 1);
+        if (levelIndex_ + 1 < int(levels().size())) startLevel(levelIndex_ + 1);
         else setState(State::Victory);
         break;
     case State::GameOver: startLevel(levelIndex_); break;
     case State::Victory: setState(State::Title); break;
+    case State::MatchOver:
+        if (mode_ != Mode::Client) startLevel((levelIndex_ + 1) % int(levels().size()));
+        break;
     default: break;
     }
 }
@@ -134,37 +282,65 @@ void Game::handleEvent(const sf::Event& e) {
         window_.setView(sf::View(sf::FloatRect({0, 0}, {float(r->size.x), float(r->size.y)})));
         return;
     }
-    const bool inPlay = state_ == State::Countdown || state_ == State::Playing || state_ == State::RoundEnd || state_ == State::Intro;
+    using K = sf::Keyboard::Key;
+
+    // Typing the host address: letters are text here, not shortcuts.
+    if (state_ == State::Lobby && mode_ == Mode::Client) {
+        const bool editable = net_.status() != Net::Status::Connecting && !net_.connected();
+        if (const auto* t = e.getIf<sf::Event::TextEntered>()) {
+            if (editable && addressChar(t->unicode) && joinAddress_.size() < 64) joinAddress_ += char(t->unicode);
+            return;
+        }
+        if (const auto* k = e.getIf<sf::Event::KeyPressed>()) {
+            if (k->code == K::Escape) quitToTitle();
+            else if (k->code == K::Enter) confirm();
+            else if (editable && k->code == K::Backspace && !joinAddress_.empty()) joinAddress_.pop_back();
+            else if (editable && k->code == K::V && k->control) {
+                for (char32_t c : sf::Clipboard::getString())
+                    if (addressChar(c) && joinAddress_.size() < 64) joinAddress_ += char(c);
+            }
+            return;
+        }
+    }
+
     if (const auto* k = e.getIf<sf::Event::KeyPressed>()) {
-        using K = sf::Keyboard::Key;
         switch (k->code) {
         case K::Escape:
-            if (paused_) paused_ = false;
-            else if (inPlay) paused_ = true;
+            if (paused_ || inPlay()) togglePause();
             else if (state_ == State::Title) window_.close();
-            else setState(State::Title);
-            window_.setMouseCursorVisible(paused_ || !inPlay);
+            else quitToTitle();
             break;
         case K::P:
-            if (inPlay) { paused_ = !paused_; window_.setMouseCursorVisible(paused_); }
+            if (inPlay()) togglePause();
             break;
         case K::Q:
-            if (paused_) { paused_ = false; setState(State::Title); }
+            if (paused_) quitToTitle();
             break;
         case K::M: audio_.toggleMute(); break;
         case K::Enter:
         case K::Space: confirm(); break;
+        case K::Up:
+        case K::W:
+        case K::Down:
+        case K::S:
+            if (state_ == State::Title) {
+                int d = (k->code == K::Up || k->code == K::W) ? -1 : 1;
+                menuItem_ = (menuItem_ + d + kMenuCount) % kMenuCount;
+                audio_.play(Sfx::Beep, 1.2f, 40);
+            }
+            break;
         case K::Left:
         case K::A:
         case K::Right:
         case K::D:
             if (state_ == State::Title) {
+                if (kMenu[menuItem_].mode == Mode::Client) break; // the host picks the arena
                 int n = int(singlePlayerLevels().size());
                 int d = (k->code == K::Left || k->code == K::A) ? -1 : 1;
                 titleLevel_ = (titleLevel_ + d + n) % n;
                 audio_.play(Sfx::Beep, 1.2f, 40);
-            } else {
-                keyboardMode_ = true;
+            } else if (mode_ != Mode::Local || k->code == K::A || k->code == K::D) {
+                keyboardMode_ = true; // in local versus the arrows belong to player 2
             }
             break;
         default: break;
@@ -173,34 +349,50 @@ void Game::handleEvent(const sf::Event& e) {
     if (const auto* m = e.getIf<sf::Event::MouseMoved>()) {
         if (std::abs(m->position.x - mouse_.x) + std::abs(m->position.y - mouse_.y) > 2) keyboardMode_ = false;
         mouse_ = m->position;
+        if (state_ == State::Title)
+            for (int i = 0; i < int(menuRects_.size()); ++i)
+                if (menuRects_[i].contains(sf::Vector2f(mouse_)) && menuItem_ != i) {
+                    menuItem_ = i;
+                    audio_.play(Sfx::Beep, 1.2f, 25);
+                }
     }
     if (const auto* b = e.getIf<sf::Event::MouseButtonPressed>()) {
-        if (b->button == sf::Mouse::Button::Left && (!inPlay || paused_)) confirm();
+        if (b->button == sf::Mouse::Button::Left && (!inPlay() || paused_)) confirm();
     }
 }
-
-HumanInput autoPilot(const World& w, float wobble); // SelfTest.cpp
 
 void Game::updateMouseTarget() {
     using K = sf::Keyboard::Key;
     if (opts_.demo && world_) {
         if (int(runTime_ * 60) % 90 == 0) demoWobble_ = std::sin(runTime_ * 7.3f) * 180;
-        input_ = autoPilot(*world_, demoWobble_);
+        input_ = autoPilot(*world_, demoWobble_, localSide());
+        if (mode_ == Mode::Local) input2_ = autoPilot(*world_, -demoWobble_, Cpu);
         return;
     }
-    if (keyboardMode_) {
+    if (mode_ == Mode::Local) {
+        // Player 2 sits at the far end but sees the same screen, so screen-left is arena-left.
         float axis = 0;
-        if (sf::Keyboard::isKeyPressed(K::Left) || sf::Keyboard::isKeyPressed(K::A)) axis -= 1;
-        if (sf::Keyboard::isKeyPressed(K::Right) || sf::Keyboard::isKeyPressed(K::D)) axis += 1;
+        if (sf::Keyboard::isKeyPressed(K::Left)) axis -= 1;
+        if (sf::Keyboard::isKeyPressed(K::Right)) axis += 1;
+        input2_.useAxis = true;
+        input2_.axis = axis;
+    }
+    if (keyboardMode_) {
+        const bool arrows = mode_ != Mode::Local;
+        float axis = 0;
+        if (sf::Keyboard::isKeyPressed(K::A) || (arrows && sf::Keyboard::isKeyPressed(K::Left))) axis -= 1;
+        if (sf::Keyboard::isKeyPressed(K::D) || (arrows && sf::Keyboard::isKeyPressed(K::Right))) axis += 1;
+        if (mode_ == Mode::Client) axis = -axis; // the client looks down the arena from the other end
         input_.useAxis = true;
         input_.axis = axis;
         return;
     }
-    // Map the cursor onto the paddle's line in 3D so the paddle sits right under it.
+    // Map the cursor onto the local paddle's line in 3D so the paddle sits right under it.
+    // (From the far end the arena appears mirrored; the projection takes care of that.)
     auto size = window_.getSize();
     gfx::Camera cam = scene_.referenceCamera();
     gfx::Mat4 vp = cam.projection(float(size.x) / float(std::max(1u, size.y))) * cam.view();
-    float z = (ArenaH / 2 - Unit) * S;
+    float z = (ArenaH / 2 - Unit) * S * (localSide() == Human ? 1.f : -1.f);
     auto px = [&](float x) {
         gfx::Vec4 c = vp * gfx::Vec4({x, 0.35f, z}, 1);
         return (c.x / c.w * 0.5f + 0.5f) * float(size.x);
@@ -212,91 +404,140 @@ void Game::updateMouseTarget() {
 }
 
 void Game::update(float dt) {
-    if (paused_) return;
-    stateTime_ += dt;
-    flash_ = std::max(0.f, flash_ - dt * 2.5f);
+    noticeTime_ = std::max(0.f, noticeTime_ - dt);
+    if (online()) netUpdate();
 
-    switch (state_) {
-    case State::Title: break;
-    case State::LevelWon:
-    case State::GameOver:
-        if (opts_.demo && stateTime_ > 3) confirm();
-        break;
-    case State::Intro:
-        if (stateTime_ > 2.6f) setState(State::Countdown);
-        break;
-    case State::Countdown: {
-        updateMouseTarget();
-        int n = 3 - int(stateTime_ / 0.7f);
-        if (n != lastCountdown_ && n > 0) {
-            audio_.play(Sfx::Beep);
-            lastCountdown_ = n;
+    if (!paused_) {
+        stateTime_ += dt;
+        flash_ = std::max(0.f, flash_ - dt * 2.5f);
+        const bool host = mode_ != Mode::Client; // the online client follows the host's flow
+
+        switch (state_) {
+        case State::Title:
+        case State::Lobby: break;
+        case State::LevelWon:
+        case State::GameOver:
+        case State::MatchOver:
+            if (opts_.demo && host && stateTime_ > 3) confirm();
+            break;
+        case State::Intro:
+            if (host && stateTime_ > 2.6f) setState(State::Countdown);
+            break;
+        case State::Countdown: {
+            updateMouseTarget();
+            int n = 3 - int(stateTime_ / 0.7f);
+            if (n != lastCountdown_ && n > 0) {
+                audio_.play(Sfx::Beep);
+                lastCountdown_ = n;
+            }
+            if (host && stateTime_ >= 2.1f) {
+                audio_.play(Sfx::Go);
+                setState(State::Playing);
+            }
+            break;
         }
-        if (stateTime_ >= 2.1f) {
-            audio_.play(Sfx::Go);
-            setState(State::Playing);
+        case State::Playing: {
+            updateMouseTarget();
+            accumulator_ += dt;
+            int steps = 0;
+            while (accumulator_ >= Timestep && steps < 6 && state_ == State::Playing) {
+                fixedStep();
+                accumulator_ -= Timestep;
+                ++steps;
+            }
+            if (steps == 6) accumulator_ = 0;
+            break;
         }
-        break;
-    }
-    case State::Playing: {
-        updateMouseTarget();
-        accumulator_ += dt;
-        int steps = 0;
-        while (accumulator_ >= Timestep && steps < 6 && state_ == State::Playing) {
-            fixedStep();
-            accumulator_ -= Timestep;
-            ++steps;
-        }
-        if (steps == 6) accumulator_ = 0;
-        break;
-    }
-    case State::RoundEnd:
-        if (stateTime_ > 2.3f) {
-            if (scores_[Human] >= WinningScore) {
+        case State::RoundEnd:
+            if (!host || stateTime_ <= 2.3f) break;
+            if (mode_ == Mode::Solo && scores_[Human] >= WinningScore) {
                 scene_.robotExplode();
                 audio_.play(Sfx::Explode);
                 audio_.play(Sfx::LevelWin);
                 setState(State::LevelWon);
-            } else if (scores_[Cpu] >= WinningScore) {
+            } else if (mode_ == Mode::Solo && scores_[Cpu] >= WinningScore) {
                 audio_.play(Sfx::GameOver);
                 scene_.robotHappy();
                 setState(State::GameOver);
+            } else if (scores_[Human] >= WinningScore || scores_[Cpu] >= WinningScore) {
+                matchOverEffects();
+                setState(State::MatchOver);
             } else {
                 newRound();
                 setState(State::Countdown);
             }
+            break;
+        default: break;
         }
-        break;
-    default: break;
+
+        const bool showWorld = state_ != State::Title && state_ != State::Lobby;
+        scene_.update(dt, showWorld ? world_.get() : nullptr);
     }
 
-    scene_.update(dt, state_ == State::Title ? nullptr : world_.get());
+    // The host shares every change of the game flow (after this frame's snapshots, so they stay in order).
+    if (mode_ == Mode::Host && handshaken_) {
+        Flow f = currentFlow();
+        if (f != flow_) {
+            sf::Packet p = message(Msg::Flow);
+            p << f;
+            net_.send(std::move(p));
+            flow_ = f;
+        }
+    }
 }
 
 void Game::fixedStep() {
-    ai_->update(*world_);
-    world_->step(input_);
+    switch (mode_) {
+    case Mode::Solo:
+        ai_->update(*world_);
+        world_->step(input_);
+        break;
+    case Mode::Local: world_->step(input_, input2_); break;
+    case Mode::Host: {
+        // The client paddle moves no faster than a local one, even when its updates arrive in bursts.
+        remoteX_ += std::clamp(remoteTarget_ - remoteX_, -PaddleMaxStep, PaddleMaxStep);
+        world_->setCpuPaddleX(remoteX_);
+        world_->step(input_);
+        sf::Packet p = message(Msg::Snapshot);
+        p << worldId_;
+        writeSnapshot(p, *world_);
+        net_.send(std::move(p));
+        break;
+    }
+    case Mode::Client: clientStep(); return;
+    }
     scene_.handleEvents(*world_);
     playEventSounds();
 
     if (world_->roundOver) {
         int loser = world_->roundLoser;
-        int winner = other(loser);
-        ++scores_[winner];
+        ++scores_[other(loser)];
         serve_ = loser;
         ++round_;
-        if (winner == Human) {
-            scene_.robotHurt();
-            audio_.play(Sfx::Score);
-            flashColor_ = sf::Color::White;
-        } else {
-            scene_.robotHappy();
-            audio_.play(Sfx::Lose);
-            flashColor_ = sf::Color(255, 60, 60);
-        }
-        flash_ = 1;
+        roundOverEffects(loser);
         setState(State::RoundEnd);
     }
+}
+
+void Game::roundOverEffects(int loser) {
+    if (loser != Human && loser != Cpu) return;
+    const int winner = other(loser);
+    const bool good = mode_ == Mode::Local || winner == localSide();
+    if (mode_ == Mode::Solo) {
+        if (winner == Human) scene_.robotHurt();
+        else scene_.robotHappy();
+    } else {
+        scene_.shake(0.8f);
+    }
+    audio_.play(good ? Sfx::Score : Sfx::Lose);
+    if (mode_ == Mode::Local) flashColor_ = sideColor(winner);
+    else flashColor_ = good ? sf::Color::White : sf::Color(255, 60, 60);
+    flash_ = 1;
+}
+
+void Game::matchOverEffects() {
+    const int winner = scores_[Human] >= WinningScore ? Human : Cpu;
+    audio_.play(mode_ == Mode::Local || winner == localSide() ? Sfx::LevelWin : Sfx::GameOver);
 }
 
 void Game::playEventSounds() {
@@ -306,7 +547,7 @@ void Game::playEventSounds() {
     };
     for (auto& e : world_->events) {
         switch (e.type) {
-        case EventType::PaddleHit: play(e.side == Human ? Sfx::PaddleHit : Sfx::CpuHit); break;
+        case EventType::PaddleHit: play(e.side == localSide() ? Sfx::PaddleHit : Sfx::CpuHit); break;
         case EventType::WallHit: play(Sfx::Wall, 1, 50); break;
         case EventType::ShieldHit: play(Sfx::Shield); break;
         case EventType::ShieldBreak: play(Sfx::ShieldBreak); break;
@@ -328,20 +569,228 @@ void Game::playEventSounds() {
     }
 }
 
+// ---------------------------------------------------------------- online
+
+void Game::startHosting() {
+    net_.close();
+    setMode(Mode::Host);
+    handshaken_ = helloSent_ = false;
+    flow_ = {};
+    if (!net_.host(opts_.port)) {
+        quitToTitle(net_.error());
+        return;
+    }
+    auto ip = sf::IpAddress::getLocalAddress();
+    localAddress_ = ip ? ip->toString() : "unknown";
+    setState(State::Lobby);
+}
+
+void Game::startJoining() {
+    net_.close();
+    setMode(Mode::Client);
+    handshaken_ = helloSent_ = false;
+    flow_ = {};
+    world_.reset();
+    notice_.clear();
+    setState(State::Lobby);
+}
+
+void Game::connectToHost() {
+    std::string host;
+    unsigned short port = opts_.port;
+    if (!parseAddress(joinAddress_, host, port)) {
+        notice_ = "That doesn't look like an address";
+        noticeTime_ = 6;
+        return;
+    }
+    notice_.clear();
+    helloSent_ = false;
+    net_.connect(host, port);
+}
+
+void Game::netUpdate() {
+    net_.poll();
+    if (net_.status() == Net::Status::Failed) {
+        std::string why = net_.error();
+        net_.close();
+        if (mode_ == Mode::Client && !handshaken_ && state_ == State::Lobby) {
+            notice_ = why; // stay in the lobby so the address can be fixed
+            noticeTime_ = 6;
+        } else {
+            quitToTitle(why);
+        }
+        return;
+    }
+    if (!net_.connected()) return;
+
+    if (mode_ == Mode::Client && !helloSent_) {
+        sf::Packet p = message(Msg::Hello);
+        p << kMagic << kProtocol;
+        net_.send(std::move(p));
+        helloSent_ = true;
+    }
+    while (online()) {
+        std::optional<sf::Packet> p = net_.receive();
+        if (!p) break;
+        if (mode_ == Mode::Host) handleHostMessage(*p);
+        else handleClientMessage(*p);
+    }
+}
+
+void Game::handleHostMessage(sf::Packet& p) {
+    std::uint8_t type = 0;
+    p >> type;
+    switch (Msg(type)) {
+    case Msg::Hello: {
+        std::uint32_t magic = 0;
+        std::uint16_t version = 0;
+        p >> magic >> version;
+        if (!p || magic != kMagic || version != kProtocol) {
+            quitToTitle("The other player runs a different version of the game");
+            return;
+        }
+        sf::Packet w = message(Msg::Welcome);
+        w << kMagic << kProtocol;
+        net_.send(std::move(w));
+        handshaken_ = true;
+        flow_ = {};
+        startLevel(titleLevel_);
+        break;
+    }
+    case Msg::PaddleX: {
+        std::uint32_t id = 0;
+        float x = 0;
+        p >> id >> x;
+        if (p && id == worldId_ && std::isfinite(x)) remoteTarget_ = std::clamp(x, 0.f, ArenaW);
+        break;
+    }
+    case Msg::PauseToggle:
+        if (handshaken_ && inPlay()) togglePause();
+        break;
+    default: break;
+    }
+}
+
+void Game::handleClientMessage(sf::Packet& p) {
+    std::uint8_t type = 0;
+    p >> type;
+    switch (Msg(type)) {
+    case Msg::Welcome: {
+        std::uint32_t magic = 0;
+        std::uint16_t version = 0;
+        p >> magic >> version;
+        if (!p || magic != kMagic || version != kProtocol) {
+            quitToTitle("The host runs a different version of the game");
+            return;
+        }
+        handshaken_ = true;
+        flow_ = {};
+        break;
+    }
+    case Msg::Flow: {
+        Flow f;
+        p >> f;
+        if (!p || !handshaken_) {
+            quitToTitle("Garbled data from the host");
+            return;
+        }
+        applyFlow(f);
+        break;
+    }
+    case Msg::Snapshot: {
+        std::uint32_t id = 0;
+        p >> id;
+        if (!world_ || id != flow_.worldId) break; // left over from the previous round
+        if (!readSnapshot(p, *world_)) {
+            quitToTitle("Out of sync with the host");
+            return;
+        }
+        placePredictedPaddle(*world_, predictedX_);
+        scene_.handleEvents(*world_);
+        playEventSounds();
+        break;
+    }
+    default: break;
+    }
+}
+
+Flow Game::currentFlow() const {
+    Flow f;
+    f.state = std::uint8_t(state_);
+    f.paused = paused_;
+    f.levelIndex = levelIndex_;
+    f.levelSerial = levelSerial_;
+    f.worldId = worldId_;
+    f.setName = set_.name;
+    f.scores[0] = scores_[0];
+    f.scores[1] = scores_[1];
+    f.round = round_;
+    f.serve = serve_;
+    f.roundLoser = world_ ? world_->roundLoser : -1;
+    return f;
+}
+
+void Game::applyFlow(const Flow& f) {
+    const auto& lv = levels();
+    const bool newLevel = !world_ || f.levelSerial != flow_.levelSerial;
+    if (newLevel) {
+        levelIndex_ = std::clamp(int(f.levelIndex), 0, int(lv.size()) - 1);
+        set_ = makeLevelSet(f.setName, rng_); // the host sends a resolved name, so this is deterministic
+    }
+    if (newLevel || f.worldId != flow_.worldId) {
+        // Same level + layout + round + serve as the host: identical starting world. Snapshots take over from there.
+        world_ = std::make_unique<World>(lv[levelIndex_], set_, f.round, f.serve == Cpu ? Cpu : Human, 0);
+        predictedX_ = ArenaW / 2;
+        accumulator_ = 0;
+        scene_.rebuildObstacles(*world_);
+    }
+    if (newLevel) {
+        scene_.setupLevel(*world_, themes()[levelIndex_ % themes().size()]);
+        scene_.startIntro();
+        input_ = {};
+    }
+    scores_[0] = f.scores[0];
+    scores_[1] = f.scores[1];
+    round_ = f.round;
+    serve_ = f.serve;
+
+    State s = f.state <= std::uint8_t(State::MatchOver) ? State(f.state) : state_;
+    if (s == State::Title || s == State::Lobby) s = state_;
+    if (s != state_ || newLevel) {
+        if (s == State::Playing && state_ == State::Countdown) audio_.play(Sfx::Go);
+        if (s == State::RoundEnd) roundOverEffects(f.roundLoser);
+        if (s == State::MatchOver) matchOverEffects();
+        setState(s);
+    }
+    paused_ = f.paused;
+    updateCursor();
+    flow_ = f;
+}
+
+void Game::clientStep() {
+    if (!world_) return;
+    const float width = world_->paddles[Cpu].width();
+    predictedX_ = World::movePaddleX(predictedX_, input_, world_->players[Cpu].mirroredTimer > 0, width);
+    sf::Packet p = message(Msg::PaddleX);
+    p << flow_.worldId << predictedX_;
+    net_.send(std::move(p));
+    placePredictedPaddle(*world_, predictedX_);
+}
+
 // ---------------------------------------------------------------- drawing
 
 void Game::draw() {
     auto size = window_.getSize();
-    const World* w = state_ == State::Title ? nullptr : world_.get();
+    const World* w = state_ == State::Title || state_ == State::Lobby ? nullptr : world_.get();
     scene_.render(renderer_, w, int(size.x), int(size.y));
     window_.resetGLStates();
     drawHud();
     window_.display();
 }
 
-void Game::drawText(const std::string& s, sf::Vector2f pos, unsigned size, sf::Color color, float alignX, float outline,
-                    sf::Color outlineColor) {
-    if (!font_) return;
+sf::FloatRect Game::drawText(const std::string& s, sf::Vector2f pos, unsigned size, sf::Color color, float alignX, float outline,
+                             sf::Color outlineColor) {
+    if (!font_) return {};
     sf::Text text(*font_, s, size);
     text.setFillColor(color);
     if (outline > 0) {
@@ -353,6 +802,101 @@ void Game::drawText(const std::string& s, sf::Vector2f pos, unsigned size, sf::C
     text.setOrigin({b.position.x + b.size.x * alignX, b.position.y + b.size.y * 0.5f});
     text.setPosition({std::round(pos.x), std::round(pos.y)});
     window_.draw(text);
+    return text.getGlobalBounds();
+}
+
+void Game::drawTitle(float W, float H, float ui) {
+    auto sz = [&](float s) { return unsigned(std::max(8.f, s * ui)); };
+    const sf::Color white(255, 255, 255), soft(255, 255, 255, 215), dim(196, 204, 218);
+    const float pulse = 0.6f + 0.4f * std::sin(stateTime_ * 3);
+
+    drawText("GREATEST", {W / 2, H * 0.12f}, sz(34), white, 0.5f, 3 * ui, kInk);
+    drawText("CUBE SLAM", {W / 2, H * 0.215f}, sz(96), white, 0.5f, 6 * ui, kInk);
+    drawText("a 3D arcade remake built with SFML", {W / 2, H * 0.3f}, sz(20), soft, 0.5f, 2 * ui, kInk);
+    if (noticeTime_ > 0 && !notice_.empty())
+        drawText(notice_, {W / 2, H * 0.355f}, sz(22), sf::Color(255, 90, 70, std::uint8_t(255 * std::min(1.f, noticeTime_))), 0.5f,
+                 3 * ui, kInk);
+
+    menuRects_.clear();
+    for (int i = 0; i < kMenuCount; ++i) {
+        const bool sel = i == menuItem_;
+        std::string label = sel ? std::string("> ") + kMenu[i].label + " <" : kMenu[i].label;
+        sf::FloatRect r = drawText(label, {W / 2, H * (0.42f + 0.06f * i)}, sz(sel ? 32 : 27), sel ? white : dim, 0.5f, 3 * ui, kInk);
+        // Generous hover area so the mouse doesn't have to hit the glyphs.
+        r.position.x = std::min(r.position.x, W / 2 - 200 * ui);
+        r.size.x = std::max(r.size.x, 400 * ui);
+        r.position.y = H * (0.42f + 0.06f * i) - H * 0.03f;
+        r.size.y = H * 0.06f;
+        menuRects_.push_back(r);
+    }
+
+    const Mode mode = kMenu[menuItem_].mode;
+    if (mode == Mode::Client) {
+        drawText("The host picks the arena", {W / 2, H * 0.7f}, sz(24), soft, 0.5f, 3 * ui, kInk);
+    } else {
+        const Level& lvl = singlePlayerLevels()[titleLevel_];
+        drawText(std::string(mode == Mode::Solo ? "<   LEVEL " : "<   ARENA ") + std::to_string(titleLevel_ + 1) + "   >",
+                 {W / 2, H * 0.7f}, sz(34), white, 0.5f, 4 * ui, kInk);
+        drawText(std::string(themes()[titleLevel_ % themes().size()].name) + "  -  " + std::to_string(lvl.shields) +
+                     (lvl.shields == 1 ? " shield" : " shields"),
+                 {W / 2, H * 0.755f}, sz(19), soft, 0.5f, 2 * ui, kInk);
+    }
+    drawText("CLICK or press ENTER", {W / 2, H * 0.835f}, sz(26), sf::Color(255, 255, 255, std::uint8_t(255 * pulse)), 0.5f, 3 * ui, kInk);
+
+    std::string help;
+    switch (mode) {
+    case Mode::Solo: help = "Mouse or A/D/Arrows: move    Up/Down: mode    Left/Right: level"; break;
+    case Mode::Local: help = "P1 (near): mouse or A/D    P2 (far): Left/Right arrows"; break;
+    case Mode::Host: help = "Hosts on TCP port " + std::to_string(opts_.port) + "    Left/Right: arena"; break;
+    case Mode::Client: help = "Connect to a friend who is hosting"; break;
+    }
+    help += "    Esc/P: pause    M: mute";
+    if (audio_.muted()) help += " (muted)";
+    drawText(help, {W / 2, H * 0.93f}, sz(17), white, 0.5f, 2 * ui, kInk);
+}
+
+void Game::drawLobby(float W, float H, float ui) {
+    auto sz = [&](float s) { return unsigned(std::max(8.f, s * ui)); };
+    const sf::Color white(255, 255, 255), soft(255, 255, 255, 215);
+    const float pulse = 0.6f + 0.4f * std::sin(stateTime_ * 3);
+
+    if (mode_ == Mode::Host) {
+        drawText("HOSTING", {W / 2, H * 0.22f}, sz(72), white, 0.5f, 5 * ui, kInk);
+        drawText(net_.connected() ? "Player connected..." : "Waiting for a player to join...", {W / 2, H * 0.36f}, sz(30),
+                 sf::Color(255, 255, 255, std::uint8_t(255 * pulse)), 0.5f, 3 * ui, kInk);
+        drawText("Your address:  " + localAddress_ + "   (port " + std::to_string(net_.port()) + ")", {W / 2, H * 0.47f}, sz(28), white,
+                 0.5f, 3 * ui, kInk);
+        drawText("Same network: share the address above.  Over the internet: forward TCP port " + std::to_string(net_.port()) +
+                     " to this computer and share your public IP.",
+                 {W / 2, H * 0.54f}, sz(17), soft, 0.5f, 2 * ui, kInk);
+        drawText("ARENA " + std::to_string(titleLevel_ + 1) + "  -  " + themes()[titleLevel_ % themes().size()].name, {W / 2, H * 0.65f},
+                 sz(24), white, 0.5f, 3 * ui, kInk);
+        drawText("Esc: cancel", {W / 2, H * 0.9f}, sz(20), white, 0.5f, 2 * ui, kInk);
+        return;
+    }
+
+    const bool connecting = net_.status() == Net::Status::Connecting;
+    drawText("JOIN GAME", {W / 2, H * 0.22f}, sz(72), white, 0.5f, 5 * ui, kInk);
+    drawText("Host address (IP or name, optionally :port)", {W / 2, H * 0.36f}, sz(22), soft, 0.5f, 2 * ui, kInk);
+
+    const float boxW = 560 * ui, boxH = 64 * ui;
+    sf::RectangleShape box({boxW, boxH});
+    box.setOrigin({boxW / 2, boxH / 2});
+    box.setPosition({W / 2, H * 0.45f});
+    box.setFillColor(sf::Color(24, 28, 38, 190));
+    box.setOutlineThickness(3 * ui);
+    box.setOutlineColor(connecting ? sf::Color(255, 255, 255, 120) : sf::Color::White);
+    window_.draw(box);
+    const bool caret = !connecting && !net_.connected() && std::fmod(stateTime_, 1.f) < 0.55f;
+    drawText(joinAddress_ + (caret ? "_" : " "), {W / 2, H * 0.45f}, sz(32), white, 0.5f);
+
+    if (net_.connected())
+        drawText("Connected! Waiting for the host...", {W / 2, H * 0.56f}, sz(26), white, 0.5f, 3 * ui, kInk);
+    else if (connecting)
+        drawText("Connecting...", {W / 2, H * 0.56f}, sz(26), sf::Color(255, 255, 255, std::uint8_t(255 * pulse)), 0.5f, 3 * ui, kInk);
+    else if (noticeTime_ > 0 && !notice_.empty())
+        drawText(notice_, {W / 2, H * 0.56f}, sz(24), sf::Color(255, 90, 70), 0.5f, 3 * ui, kInk);
+    drawText("Enter: connect    Ctrl+V: paste    Esc: back", {W / 2, H * 0.9f}, sz(20), white, 0.5f, 2 * ui, kInk);
 }
 
 void Game::drawHud() {
@@ -366,47 +910,43 @@ void Game::drawHud() {
         drawText(l.text, {l.px.x, l.px.y}, sz(17 * l.scale), toSf(l.color), 0.5f, 2.5f * ui, kInk);
 
     if (state_ == State::Title) {
-        float pulse = 0.6f + 0.4f * std::sin(stateTime_ * 3);
-        drawText("GREATEST", {W / 2, H * 0.17f}, sz(34), white, 0.5f, 3 * ui, kInk);
-        drawText("CUBE SLAM", {W / 2, H * 0.27f}, sz(96), white, 0.5f, 6 * ui, kInk);
-        drawText("a 3D arcade remake built with SFML", {W / 2, H * 0.37f}, sz(20), sf::Color(255, 255, 255, 220), 0.5f, 2 * ui, kInk);
-
-        const Level& lvl = singlePlayerLevels()[titleLevel_];
-        (void)lvl;
-        drawText("<   LEVEL " + std::to_string(titleLevel_ + 1) + "   >", {W / 2, H * 0.55f}, sz(40), white, 0.5f, 4 * ui, kInk);
-        drawText(std::string(themes()[titleLevel_ % themes().size()].name) + "  -  " + std::to_string(lvl.shields) +
-                     (lvl.shields == 1 ? " shield" : " shields"),
-                 {W / 2, H * 0.62f}, sz(20), sf::Color(255, 255, 255, 220), 0.5f, 2 * ui, kInk);
-        drawText("CLICK or press ENTER to play", {W / 2, H * 0.74f}, sz(28), sf::Color(255, 255, 255, std::uint8_t(255 * pulse)), 0.5f,
-                 3 * ui, kInk);
-        drawText("Mouse or A/D/Arrows: move    Esc/P: pause    M: mute" + std::string(audio_.muted() ? " (muted)" : ""),
-                 {W / 2, H * 0.92f}, sz(17), white, 0.5f, 2 * ui, kInk);
+        drawTitle(W, H, ui);
+        return;
+    }
+    if (state_ == State::Lobby) {
+        drawLobby(W, H, ui);
         return;
     }
 
     if (!world_) return;
     const World& w = *world_;
     const Theme& th = scene_.theme();
+    const bool solo = mode_ == Mode::Solo;
+    const int me = localSide(), them = other(me);
 
     // --- top bar: level + score pips ---
-    drawText("LEVEL " + std::to_string(levelIndex_ + 1) + "/" + std::to_string(singlePlayerLevels().size()), {24 * ui, 30 * ui},
-             sz(24), white, 0, 3 * ui, kInk);
-    drawText(w.set.name == "empty" ? std::string(th.name) : std::string(th.name) + " - " + w.set.name, {24 * ui, 58 * ui}, sz(15),
-             sf::Color(255, 255, 255, 210), 0, 2 * ui, kInk);
+    std::string where = w.set.name == "empty" ? std::string(th.name) : std::string(th.name) + " - " + w.set.name;
+    if (solo) {
+        drawText("LEVEL " + std::to_string(levelIndex_ + 1) + "/" + std::to_string(levels().size()), {24 * ui, 30 * ui}, sz(24), white, 0,
+                 3 * ui, kInk);
+    } else {
+        drawText("ARENA " + std::to_string(levelIndex_ + 1), {24 * ui, 30 * ui}, sz(24), white, 0, 3 * ui, kInk);
+        where += mode_ == Mode::Local ? "  |  LOCAL VERSUS" : "  |  ONLINE";
+    }
+    drawText(where, {24 * ui, 58 * ui}, sz(15), sf::Color(255, 255, 255, 210), 0, 2 * ui, kInk);
 
     const float cy = 32 * ui, r = 9 * ui, gap = 26 * ui;
-    drawText("YOU", {W / 2 - 4.2f * gap, cy}, sz(20), white, 1, 3 * ui, kInk);
-    drawText("CUBOT", {W / 2 + 4.2f * gap, cy}, sz(20), white, 0, 3 * ui, kInk);
+    drawText(sideName(me), {W / 2 - 4.2f * gap, cy}, sz(20), white, 1, 3 * ui, kInk);
+    drawText(sideName(them), {W / 2 + 4.2f * gap, cy}, sz(20), white, 0, 3 * ui, kInk);
     for (int side = 0; side < 2; ++side)
         for (int i = 0; i < WinningScore; ++i) {
             sf::CircleShape c(r);
             c.setOrigin({r, r});
-            float x = side == Human ? W / 2 - gap * (3.2f - i) : W / 2 + gap * (1.2f + i);
+            float x = side == me ? W / 2 - gap * (3.2f - i) : W / 2 + gap * (1.2f + i);
             c.setPosition({x, cy});
             c.setOutlineThickness(2.5f * ui);
             c.setOutlineColor(kInk);
-            sf::Color filled = toSf(side == Human ? th.shieldHuman : th.shieldCpu);
-            c.setFillColor(scores_[side] > i ? filled : sf::Color(255, 255, 255, 90));
+            c.setFillColor(scores_[side] > i ? sideColor(side) : sf::Color(255, 255, 255, 90));
             window_.draw(c);
         }
 
@@ -426,13 +966,14 @@ void Game::drawHud() {
         int shieldsUp = 0;
         for (int s : pl.shields) shieldsUp += s;
         list.push_back("SHIELDS " + std::to_string(shieldsUp) + "/" + std::to_string(pl.shields.size()));
+        if (!solo) list.back() = sideName(side) + "  " + list.back();
         return list;
     };
-    auto human = effects(Human), cpu = effects(Cpu);
-    for (size_t i = 0; i < human.size(); ++i)
-        drawText(human[i], {24 * ui, H - (24 + 26 * float(human.size() - 1 - i)) * ui}, sz(18), toSf(th.shieldHuman), 0, 3 * ui, kInk);
-    for (size_t i = 0; i < cpu.size(); ++i)
-        drawText(cpu[i], {W - 24 * ui, H - (24 + 26 * float(cpu.size() - 1 - i)) * ui}, sz(18), toSf(th.shieldCpu), 1, 3 * ui, kInk);
+    auto mine = effects(me), theirs = effects(them);
+    for (size_t i = 0; i < mine.size(); ++i)
+        drawText(mine[i], {24 * ui, H - (24 + 26 * float(mine.size() - 1 - i)) * ui}, sz(18), sideColor(me), 0, 3 * ui, kInk);
+    for (size_t i = 0; i < theirs.size(); ++i)
+        drawText(theirs[i], {W - 24 * ui, H - (24 + 26 * float(theirs.size() - 1 - i)) * ui}, sz(18), sideColor(them), 1, 3 * ui, kInk);
 
     std::vector<std::string> center;
     for (auto& p : w.pucks) {
@@ -451,12 +992,23 @@ void Game::drawHud() {
         float a = 0.6f + 0.4f * std::sin(stateTime_ * 4);
         drawText(s, {W / 2, H * y}, sz(24), sf::Color(255, 255, 255, std::uint8_t(255 * a)), 0.5f, 3 * ui, kInk);
     };
+    // "YOU SCORE!", "CUBOT SCORES!", "PLAYER 2 SCORES!", "RIVAL SCORES!"
+    auto longName = [&](int side) {
+        if (mode_ == Mode::Local) return std::string(side == Human ? "PLAYER 1" : "PLAYER 2");
+        return sideName(side);
+    };
+    auto verb = [&](int side, const char* you, const char* others) {
+        return longName(side) + (mode_ != Mode::Local && side == me ? you : others);
+    };
     switch (state_) {
     case State::Intro: {
         std::uint8_t a = std::uint8_t(255 * std::clamp(std::min(stateTime_ * 2, (2.6f - stateTime_) * 2), 0.f, 1.f));
-        big("LEVEL " + std::to_string(levelIndex_ + 1), 0.4f, 1.2f, sf::Color(255, 255, 255, a));
+        big((solo ? "LEVEL " : "ARENA ") + std::to_string(levelIndex_ + 1), 0.4f, 1.2f, sf::Color(255, 255, 255, a));
         drawText("First to " + std::to_string(WinningScore) + " wins", {W / 2, H * 0.5f}, sz(24), sf::Color(255, 255, 255, a), 0.5f,
                  3 * ui, kInk);
+        if (mode_ == Mode::Local)
+            drawText("P1 (near): mouse or A/D      P2 (far): Left/Right arrows", {W / 2, H * 0.56f}, sz(22), sf::Color(255, 255, 255, a),
+                     0.5f, 3 * ui, kInk);
         break;
     }
     case State::Countdown: {
@@ -469,25 +1021,34 @@ void Game::drawHud() {
         if (stateTime_ < 0.7f) big("SLAM!", 0.42f, 1.4f + stateTime_, sf::Color(255, 255, 255, std::uint8_t(255 * (1 - stateTime_ / 0.7f))));
         break;
     case State::RoundEnd:
-        if (w.roundLoser == Cpu) big("YOU SCORE!", 0.42f, 1, toSf(th.shieldHuman));
-        else big("CUBOT SCORES!", 0.42f, 1, toSf(th.shieldCpu));
+        if (w.roundLoser == Human || w.roundLoser == Cpu) {
+            int winner = other(w.roundLoser);
+            big(verb(winner, " SCORE!", " SCORES!"), 0.42f, 1, sideColor(winner));
+        }
         break;
     case State::LevelWon:
         big("LEVEL CLEAR!", 0.38f, 1.2f, white);
-        hint(levelIndex_ + 1 < int(singlePlayerLevels().size()) ? "Click or press Enter for level " + std::to_string(levelIndex_ + 2)
-                                                                 : "Click or press Enter",
+        hint(levelIndex_ + 1 < int(levels().size()) ? "Click or press Enter for level " + std::to_string(levelIndex_ + 2)
+                                                     : "Click or press Enter",
              0.5f);
         break;
     case State::GameOver:
-        big("CUBOT WINS", 0.38f, 1.2f, toSf(th.shieldCpu));
+        big("CUBOT WINS", 0.38f, 1.2f, sideColor(Cpu));
         hint("Enter: retry level    Esc: menu", 0.5f);
         break;
     case State::Victory:
         big("YOU BEAT CUBOT!", 0.36f, 1.2f, white);
-        drawText("All " + std::to_string(singlePlayerLevels().size()) + " levels cleared", {W / 2, H * 0.46f}, sz(28), white, 0.5f, 3 * ui,
-                 kInk);
+        drawText("All " + std::to_string(levels().size()) + " levels cleared", {W / 2, H * 0.46f}, sz(28), white, 0.5f, 3 * ui, kInk);
         hint("Press Enter", 0.56f);
         break;
+    case State::MatchOver: {
+        int winner = scores_[Human] >= WinningScore ? Human : Cpu;
+        big(verb(winner, " WIN!", " WINS!"), 0.38f, 1.2f, sideColor(winner));
+        drawText(std::to_string(scores_[me]) + " - " + std::to_string(scores_[them]), {W / 2, H * 0.47f}, sz(34), white, 0.5f, 3 * ui,
+                 kInk);
+        hint(mode_ == Mode::Client ? "Waiting for the host...    Esc: leave" : "Enter: next arena    Esc: menu", 0.56f);
+        break;
+    }
     default: break;
     }
 
@@ -504,6 +1065,7 @@ void Game::drawHud() {
         window_.draw(shade);
         big("PAUSED", 0.4f, 1, white);
         drawText("Enter: resume    Q: quit to menu    M: mute", {W / 2, H * 0.5f}, sz(22), white, 0.5f, 3 * ui, kInk);
+        if (online()) drawText("(paused for both players)", {W / 2, H * 0.55f}, sz(18), white, 0.5f, 2 * ui, kInk);
     }
     if (audio_.muted()) drawText("MUTED", {W - 24 * ui, 30 * ui}, sz(16), white, 1, 2 * ui, kInk);
 }

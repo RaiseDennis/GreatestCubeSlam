@@ -139,7 +139,24 @@ void World::checkMaxSpeed(Puck& p) {
     if (length(p.vel) / UnitSpeed > maxSpeed) setSpeed(p, maxSpeed);
 }
 
-void World::step(const HumanInput& input) {
+void World::step(const HumanInput& input) { stepImpl(input, nullptr); }
+
+void World::step(const HumanInput& bottom, const HumanInput& top) { stepImpl(bottom, &top); }
+
+float World::movePaddleX(float x, const HumanInput& input, bool mirrored, float width, float wobble) {
+    float target;
+    if (input.useAxis) target = x + input.axis * (mirrored ? -1.f : 1.f) * PaddleMaxStep * 2;
+    else target = mirrored ? ArenaW - input.targetX : input.targetX;
+    x += clamp((target + wobble - x) * 0.5f, -PaddleMaxStep, PaddleMaxStep);
+    return clamp(x, width / 2, ArenaW - width / 2);
+}
+
+float World::dizzyOffset(int side) const {
+    float t = paddles[side].dizzyTimer;
+    return t > 0 ? std::sin(frame * 0.9f) * 160.f * std::min(1.f, t) : 0.f;
+}
+
+void World::stepImpl(const HumanInput& bottom, const HumanInput* top) {
     events.clear();
     ++frame;
     if (roundOver) return;
@@ -147,22 +164,18 @@ void World::step(const HumanInput& input) {
     stepTimers();
 
     // --- paddles ---
-    {
-        Paddle& h = paddles[Human];
-        const bool mirrored = players[Human].mirroredTimer > 0;
-        float target;
-        if (input.useAxis) target = h.x + input.axis * (mirrored ? -1.f : 1.f) * PaddleMaxStep * 2;
-        else target = mirrored ? ArenaW - input.targetX : input.targetX;
-        if (h.dizzyTimer > 0) target += std::sin(frame * 0.9f) * 160.f * std::min(1.f, h.dizzyTimer);
-        h.prevX = h.x;
-        h.x += clamp((target - h.x) * 0.5f, -PaddleMaxStep, PaddleMaxStep);
-        clampPaddle(h);
-
+    auto steer = [&](int side, const HumanInput& in) {
+        Paddle& pd = paddles[side];
+        pd.prevX = pd.x;
+        pd.x = movePaddleX(pd.x, in, players[side].mirroredTimer > 0, pd.width(), dizzyOffset(side));
+    };
+    steer(Human, bottom);
+    if (top) {
+        steer(Cpu, *top);
+    } else {
         Paddle& c = paddles[Cpu];
-        float ct = cpuTargetX_;
-        if (c.dizzyTimer > 0) ct += std::sin(frame * 0.9f) * 160.f * std::min(1.f, c.dizzyTimer);
         c.prevX = c.x;
-        c.x = ct;
+        c.x = cpuTargetX_ + dizzyOffset(Cpu);
         clampPaddle(c);
     }
 

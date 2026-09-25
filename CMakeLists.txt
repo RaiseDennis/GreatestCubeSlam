@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ---- SFML 3 (fetched + built from source, static) ----
 include(FetchContent)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-set(SFML_BUILD_NETWORK OFF CACHE BOOL "" FORCE)
+set(SFML_BUILD_NETWORK ON CACHE BOOL "" FORCE)
 FetchContent_Declare(SFML
     URL https://github.com/SFML/SFML/archive/refs/tags/3.1.0.tar.gz
     DOWNLOAD_EXTRACT_TIMESTAMP ON
@@ -19,7 +19,7 @@ FetchContent_MakeAvailable(SFML)
 file(GLOB_RECURSE GAME_SOURCES CONFIGURE_DEPENDS src/*.cpp)
 add_executable(CubeSlam ${GAME_SOURCES})
 target_include_directories(CubeSlam PRIVATE src)
-target_link_libraries(CubeSlam PRIVATE SFML::Graphics SFML::Audio SFML::Window SFML::System)
+target_link_libraries(CubeSlam PRIVATE SFML::Graphics SFML::Audio SFML::Network SFML::Window SFML::System)
 
 if(WIN32)
     target_link_libraries(CubeSlam PRIVATE opengl32)

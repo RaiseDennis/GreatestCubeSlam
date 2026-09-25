@@ -218,8 +218,8 @@ void Scene::handleEvents(const World& world) {
             break;
         case EventType::ExtraActivate:
             burst(toWorld(e.pos, 0.9f), extraColor(e.extra), 26, 7, 0.28f, true);
-            floatText(toWorld(e.pos, 1.5f), std::string(extraName(e.extra)) + (e.side == Human ? "!" : " (CUBOT)"),
-                      extraColor(e.extra), 1.2f);
+            floatText(toWorld(e.pos, 1.5f), std::string(extraName(e.extra)) + sideTags_[e.side == Cpu ? 1 : 0], extraColor(e.extra),
+                      1.2f);
             break;
         case EventType::ExtraExpire: burst(toWorld(e.pos, 0.9f), extraColor(e.extra), 8, 2, 0.15f, true); break;
         case EventType::LaserFire: burst(at, Color::hex(0xff3030), 6, 2, 0.15f, true); break;
@@ -260,8 +260,20 @@ void Scene::handleEvents(const World& world) {
 gfx::Camera Scene::referenceCamera() const {
     gfx::Camera c;
     c.fovDegrees = 50;
-    c.eye = {humanX_ * 0.25f, 10.5f, HL + 13.5f};
-    c.target = {humanX_ * 0.08f, 0, -3.0f};
+    switch (view_) {
+    case View::Solo:
+        c.eye = {humanX_ * 0.25f, 10.5f, HL + 13.5f};
+        c.target = {humanX_ * 0.08f, 0, -3.0f};
+        break;
+    case View::Top: // the same view from the other end of the arena
+        c.eye = {humanX_ * 0.25f, 10.5f, -(HL + 13.5f)};
+        c.target = {humanX_ * 0.08f, 0, 3.0f};
+        break;
+    case View::Overhead: // steep and centred so both ends read equally well
+        c.eye = {0, 30.5f, 13.f};
+        c.target = {0, 0, 1.5f};
+        break;
+    }
     return c;
 }
 
@@ -273,9 +285,10 @@ void Scene::update(float dt, const World* world) {
     robotHurt_ = std::max(0.f, robotHurt_ - dt);
 
     if (world) {
-        float fogTarget = world->players[Human].fogTimer > 0 ? 1.f : 0.f;
+        const int viewSide = view_ == View::Top ? Cpu : Human;
+        float fogTarget = view_ != View::Overhead && world->players[viewSide].fogTimer > 0 ? 1.f : 0.f;
         fog_ = gfx::approach(fog_, fogTarget, 4, dt);
-        humanX_ = gfx::approach(humanX_, (world->paddles[Human].x - ArenaW / 2) * S, 10, dt);
+        humanX_ = gfx::approach(humanX_, (world->paddles[viewSide].x - ArenaW / 2) * S, 10, dt);
         cpuPaddleX_ = (world->paddles[Cpu].x - ArenaW / 2) * S;
         float look = 0;
         if (!world->pucks.empty()) look = gfx::clamp((world->pucks[0].pos.x - ArenaW / 2) / (ArenaW / 2), -1, 1);
@@ -347,7 +360,12 @@ void Scene::update(float dt, const World* world) {
         camera_.target = {0, 1.5f, -4};
     } else {
         float t = gfx::smoothstep(introTime_ / 2.6f);
+        // Solo: swoop in from CUBOT. Versus: from high above the side of the arena.
         Vec3 startEye{-16, 22, kRobotZ + 22}, startTarget{0, 5, kRobotZ};
+        if (!cubotPlays_) {
+            startEye = {-24, 26, 0};
+            startTarget = {0, 0, 0};
+        }
         camera_.eye = gfx::lerp(startEye, ref.eye, t);
         camera_.target = gfx::lerp(startTarget, ref.target, t);
     }
@@ -552,7 +570,7 @@ void Scene::render(gfx::Renderer& r, const World* world, int width, int height) 
         for (auto& b : world->bullets) cube(r, toWorld(b.pos, 0.4f), {0.25f, 0.25f, 1.5f}, Color::hex(0xff2a2a), 1);
     }
 
-    drawRobot(r, world);
+    if (cubotPlays_ || titleMode_) drawRobot(r, world);
 
     for (auto& p : particles_) {
         if (p.glow) continue;
